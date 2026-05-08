@@ -1,65 +1,92 @@
-# 西安交通大学机器人团队库文件
+# 西安交通大学机器人团队资源库
 
-## 项目简介
+> 面向机器人研发协作的团队公共资源库，集中管理主控程序、开发板例程、机械模型与工程文档。
 
-本仓库包含西安交通大学机器人团队的核心代码库，主要包括：
+![Repository](https://img.shields.io/badge/repository-team--library-2f6fed)
+![Status](https://img.shields.io/badge/status-active-28a745)
+![Language](https://img.shields.io/badge/language-C%20%2F%20C%2B%2B-orange)
+![License](https://img.shields.io/badge/license-internal-lightgrey)
 
-- **控制算法**：机器人运动控制、路径规划等相关算法
-- **传感器代码**：各类传感器驱动与数据处理
-- **页面导航**：HMI 人机界面与导航逻辑
+## 项目概览
+
+本仓库用于沉淀西安交通大学机器人团队在机器人研发过程中的通用资产，帮助团队成员快速复用已有成果、统一协作方式，并降低新成员上手成本。
+
+主要内容包括：
+
+| 模块 | 说明 |
+| --- | --- |
+| `mainboard/` | 机器人主板相关驱动、通信协议与核心控制逻辑 |
+| `development/` | 各类开发板例程、验证代码与功能模块 |
+| `models/` | 机械结构、零件、装配体等 3D 模型文件 |
+| `docs/` | 设计说明、接口文档、开发规范与技术沉淀 |
 
 ## 目录结构
 
-```
+```text
 xjtu_rover_team_lib/
-├── README.md
-├── models/                 # 3D模型文件
-├── mainboard/              # 主板代码
-├── development/            # 开发板代码
-└── docs/                   # 开发文档
+├── README.md              # 仓库说明与快速入口
+├── CONTRIBUTING.md        # 协作与提交规范
+├── .gitignore             # 常见临时文件与构建产物忽略规则
+├── .editorconfig          # 编辑器基础格式约定
+├── .gitattributes         # Git 文本与二进制文件处理规则
+├── mainboard/             # 主板代码
+├── development/           # 开发板代码
+├── models/                # 3D 模型文件
+└── docs/                  # 开发文档
 ```
 
 ## 快速开始
 
-### 环境要求
-
-- 开发环境配置指南（待补充）
-
 ### 克隆仓库
 
 ```bash
-git clone https://github.com/your-repo/xjtu_rover_team_lib.git
+git clone https://github.com/laihanwen/xjtu_rover_team_lib.git
 cd xjtu_rover_team_lib
 ```
 
-### 创建分支
+### 创建开发分支
 
-首次推送代码前，请自行创建自己的分支：
+建议每个功能、修复或实验使用独立分支：
 
 ```bash
 git checkout -b your-name/feature-name
 ```
 
-## 贡献指南
+分支命名建议：
 
-我们欢迎所有团队成员贡献代码！
+- `name/feature-xxx`：新增功能或模块
+- `name/fix-xxx`：问题修复
+- `name/docs-xxx`：文档补充
+- `name/experiment-xxx`：实验性验证
 
-### 提交流程
+## 协作流程
 
-1. **创建分支**：从 `main` 分支创建新分支，命名规范：`姓名/功能描述`
-2. **开发调试**：在分支上进行开发，定期与主干同步
-3. **提交代码**：提交时请附上清晰的 commit 信息
-4. **代码审查**：提交 Pull Request，等待审查
-5. **合并部署**：经审查通过后合并到主干
+1. 从最新主分支创建个人开发分支。
+2. 在对应目录中补充代码、模型或文档。
+3. 提交前检查文件命名、目录归属和 README 是否需要同步更新。
+4. 使用清晰的 commit 信息说明本次变更。
+5. 通过 Pull Request 合并到主分支，并在 PR 中写明变更内容、测试方式和注意事项。
 
-### 注意事项
+更多细节请参考 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-- 请保持代码风格一致
-- 重要修改请附带测试
-- 如有疑问，请在群里提出，大家一起讨论调试
+## 文档约定
+
+- 新增模块时，请在对应目录添加或更新 `README.md`。
+- 接口、协议、引脚定义、依赖版本等信息应写入 `docs/`，避免只存在于聊天记录或个人笔记中。
+- 机械模型建议补充导出格式、单位、适配版本和装配说明。
+- 实验性代码请标注适用硬件、接线方式和验证状态。
+
+## 当前待补充
+
+- 主控板具体型号、芯片平台与开发环境。
+- 开发板清单与对应例程说明。
+- 通信协议、传感器接口、控制算法的设计文档。
+- 机械模型的版本、单位、坐标系和装配关系。
 
 ## 联系方式
 
-- **团队邮箱**：2777651780@qq.com
+- 团队邮箱：2777651780@qq.com
 
 ---
+
+维护建议：当目录结构、硬件平台或协作流程发生变化时，请同步更新本 README。

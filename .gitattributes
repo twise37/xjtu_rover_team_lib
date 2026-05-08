@@ -1,0 +1,26 @@
+* text=auto eol=lf
+
+# Markdown and source files
+*.md text eol=lf
+*.c text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.hpp text eol=lf
+*.py text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+
+# Images and CAD/model assets
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary
+*.stl binary
+*.step binary
+*.stp binary
+*.iges binary
+*.igs binary
+*.sldprt binary
+*.sldasm binary
+*.slddrw binary

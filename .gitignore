@@ -1,0 +1,60 @@
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.user
+*.suo
+*.tmp
+*.bak
+
+# Build outputs
+build/
+dist/
+out/
+bin/
+obj/
+Debug/
+Release/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# PlatformIO and embedded tooling
+.pio/
+.pioenvs/
+.piolibdeps/
+.platformio/
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+
+# Python utilities
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Logs and local environment
+*.log
+*.local
+.env
+.env.*
+
+# CAD temporary files
+~$*
+*.SLDPRT.bak
+*.SLDASM.bak
+*.SLDDRW.bak
+*.stl.tmp
