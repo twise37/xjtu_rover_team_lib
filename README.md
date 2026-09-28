@@ -43,6 +43,7 @@ xjtu_rover_team_lib/
 git clone https://github.com/laihanwen/xjtu_rover_team_lib.git
 cd xjtu_rover_team_lib
 ```
+若无仓库写权限，先 Fork 本仓库，再克隆自己的 Fork。
 
 ### 创建开发分支
 
