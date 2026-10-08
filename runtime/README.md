@@ -6,6 +6,10 @@
 
 `mission.profile` 默认为 `task_one`。共享Mission FSM已经定义完整比赛阶段；设置为`full`后，四锥阶段会继续进入海参、抓取、运输、释放、转盘、返航和上浮流程。但在前视视觉和后续运动控制接通前，完整模式会按阶段超时进入FAULT，不能视为可下水的完整任务配置。
 
+`task_one` 建图/规划完成、进入遍历前会先上浮：识别到 AprilTag 后运行时自动开启上浮（`motion.surface_before_traversal` 默认 `false`，仅 `task_one` 自动置 true）。ARM 后先把深度保持到 `motion.surface_depth_m`（默认 0.5m，容差 `surface_tolerance_m`，稳定 `surface_stable_sec`），期间无水平运动；触发 `SURFACED` 事件后开始遍历并保持该深度。显式把 `surface_before_traversal` 设为 `true` 可无条件开启（例如 `full` 模式）；上浮超时 `surface_timeout_sec` 会进入 FAULT 并请求 DISARM。
+
+遍历与离场期间启用深度保持看门狗：深度偏离 `motion.surface_depth_m` 超过 `depth_deadzone_m`（默认 5cm）时暂停水平运动、保持深度目标，由 STM32 depth PID 把深度带回死区内；在带内持续 `depth_recover_stable_sec`（默认 0.5s）后恢复运动，暂停超过 `depth_pause_timeout_sec`（默认 10s）则 FAULT 并请求 DISARM。遍历完所有交通锥后，按最后锥所在格就近离开九宫格（边/角格走最近出格方向，中间格转向无锥的边中点方向），以 `depart_speed` 盲走 `depart_duration_sec`（默认 0.08 / 2.0s）后进入 `COMPLETE` 并 DISARM；离场同样受深度看门狗覆盖。
+
 ## 原生构建
 
 在 Debian 13 / Raspberry Pi OS 上，确保已安装 `cmake`、`ninja-build`、`g++`、`libopencv-dev`、`libyaml-cpp-dev`、`libcpp-httplib-dev` 和 `ffmpeg`，然后执行：
@@ -42,6 +46,49 @@ CSI 启动等待首帧最多 8 秒，连续采集后无帧 2 秒则重启该相�
 只读接口 `/api/camera/down.jpg` 和 `/api/camera/front.jpg` 返回各自最新 JPEG；过期时返回 HTTP 503。`/api/status` 增加 `down_capture_frames`、`front_frames`、`front_hz`、`front_camera_age_sec`、`front_degraded` 和 `front_detail`。采集帧率、视觉处理帧率与视频输出帧率分别统计，不能相互代替。
 
 `ctest --test-dir build-lightweight --output-on-failure` 包含 MJPEG 分包/缓冲上限测试，以及双相机模拟、CSI分别作为下视/前视时卡住后的另一相机及控制持续运行、子进程退出清理测试；这些测试不访问真实硬件或串口。
+
+## 待办：前视建图 + 下视定位重构（规划中，未实现）
+
+目标：由**前视摄像头**先完成初步建图与遍历路径规划；再由**下视摄像头**观测当前所在格点，实现路径记录（`visited` 标记）与当前格点判定。本节记录任务、风险点与涉及代码的规划，当前尚未落地。本节生效后，上方「双摄像头」章节描述的相机职责（下视建图、前视仅预览）将随之变更。
+
+### 目标职责划分
+
+| 摄像头 | 阶段 | 职责 | 产出 |
+| --- | --- | --- | --- |
+| 前视 | 建图 / 规划 | 建图（GridMapper + ConeDetector/Tracker）、建图期位姿，无 AprilTag | `map_`、前视位姿、`video_frame_`（建图视角） |
+| 下视 | 全阶段 | AprilTag 触发、观测当前格点（→ 路径记录 + 格点判定）、锥体分类修正 | `tag_found_`、下视位姿、修正结果 |
+
+### 任务清单
+
+1. `vision_loop` 改造为前视建图循环：消费 `front_frame_/front_sequence_/front_time_`，用前视内参 undistort，去掉 AprilTag，`map_` complete 后冻结（`if (!map_.complete) map_ = map`）。
+2. `front_loop` 增加 `front_sequence_` 计数（供视觉线程按新帧去重）。
+3. 新增 `down_vision_loop`：AprilTag → `tag_found_`；GridMapper → 下视位姿（`down_row_/down_col_`）；ConeDetector/Tracker → 修正。
+4. 位姿按相位切换：`≤kPlanCones` 取前视位姿，`kVisitCones` 及以后取下视位姿（per-camera 位姿字段 + `active_pose(phase)`）。
+5. 下视修正（下视 wins、改地图不改路由）：分类不一致改 `object_type`；存在性不一致（前视漏锥）补入地图 cell；两种情况都不重规划、不碰 `plan_`/`route_`。
+6. `camera_front` 增加 `camera_matrix`/`distortion_coefficients`（additive，默认空）；`enabled` 默认 `false`，测试显式 `true`。
+7. 保留单 `safety.frame_timeout_sec`（不做双超时，避免改动部署模板与 `pi-rov.yaml`）。
+
+### 风险点（按严重程度排序）
+
+1. **前视漏锥不可自愈**：路线在建图/规划期冻结，前视因遮挡/畸变漏判的锥不会被排进路线，物理上漏访；下视事后只能改地图、改不了路线。
+2. **双相机网格坐标系一致性**：前视与下视的 `camera_row/col` 必须指向同一物理格子；镜像/旋转会导致修正写错 cell、位姿切换跳变。
+3. **前视单点故障**：建图全压前视，前视失效 → `BUILD_MAP` 走 `map_timeout_sec` FAULT，无下视兜底建图。
+4. **计算量翻倍**：grid+cone 检测跑两遍（前视 + 下视），Pi 4B 可能掉帧 → 误报 `frame_timeout` FAULT。
+5. **位姿相位切换跳变**：PLAN 用前视定起始格，VISIT_CONES 用下视定位，两者不一致则遍历起点错。
+6. **回归风险**：深度看门狗/离场逻辑读全局位姿，重构为 per-camera 位姿后必须保留离场（`kDeparting`）的 pose 超时豁免。
+7. **验证缺口**：单静止图 harness 无法覆盖相位切换与修正，需移动相机模拟（第二阶段）才能真正验证。
+
+### 涉及代码（规划）
+
+- `runtime/config/runtime.yaml`：`camera_front` 增加内参 key。
+- `runtime/src/runtime.cpp`：
+  - `Config` / `load_config`：前视内参解析与校验。
+  - `front_loop`：加 `front_sequence_`。
+  - `vision_loop`：换输入/内参、去 tag、冻结 `map_`、写前视位姿。
+  - 新增 `down_vision_loop`。
+  - 位姿切换：per-camera 位姿 + `active_pose(phase)`，替换 `arm_gate_ready` / pose 超时 / `route_.set_pose` 的位姿读取。
+  - 修正 helper：改 `map_.grid.cells[i].cell.object_type`，不碰 `plan_` / `route_`。
+- `runtime/test_scripts/harness.py` 及测试：双路相机注入、断言重写（`apriltag_found` 来自下视、`map_` 来自前视、`VISIT_CONES` 位姿来自下视）。
 
 ## 自主模式
 

@@ -64,6 +64,23 @@ motion:
   motion_commands_enabled: false
   directions_calibrated: false
   limits_calibrated: false
+  # Base value for surfacing before cone traversal. Defaults to false; the
+  # runtime auto-enables it once AprilTag is detected in task_one. Set true to
+  # force it regardless of AprilTag.
+  surface_before_traversal: false
+  surface_depth_m: 0.5         # ascent target depth, also held during traversal (m)
+  surface_tolerance_m: 0.05    # depth band for "surfaced"
+  surface_stable_sec: 1.0      # seconds the depth must stay in band
+  surface_timeout_sec: 30.0    # surfacing timeout
+  # Depth hold watchdog (traversal + departure): if depth drifts beyond the dead
+  # zone around surface_depth_m, pause horizontal motion and let STM32 recover;
+  # resume after staying in band for recover_stable_sec, else FAULT after timeout.
+  depth_deadzone_m: 0.05       # ±dead zone: no intervention within this band (m)
+  depth_recover_stable_sec: 0.5  # in-band duration required before resuming
+  depth_pause_timeout_sec: 10.0  # pause escalation to FAULT
+  # Leave the 3x3 grid after all cones are visited (blind, fixed duration).
+  depart_speed: 0.08           # blind departure speed (same units as maximum_speed)
+  depart_duration_sec: 2.0     # blind departure duration
   surge_from_row: 0.0
   surge_from_col: 0.0
   sway_from_row: 0.0

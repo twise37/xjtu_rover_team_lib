@@ -90,6 +90,11 @@ struct Config {
   double status_timeout{0.5}, frame_timeout{0.5}, pose_timeout{0.5}, control_watchdog_timeout{0.25};
   double actuator_status_timeout{0.5};
   bool motion_enabled{}, directions_calibrated{}, limits_calibrated{};
+  bool surface_before_traversal{};
+  double surface_depth_m{0.1}, surface_tolerance_m{0.05}, surface_stable_sec{1.0};
+  double surface_timeout_sec{30.0};
+  double depth_deadzone_m{0.05}, depth_recover_stable_sec{0.5}, depth_pause_timeout_sec{10.0};
+  double depart_speed{0.08}, depart_duration_sec{2.0};
   auv_control::RouteExecutorConfig route;
   auv_mapping::GridMapperConfig grid;
   auv_vision::ConeDetectorConfig cone;
@@ -155,6 +160,16 @@ static Config load_config(const std::string& path) {
   c.motion_enabled = y["motion"]["motion_commands_enabled"].as<bool>();
   c.directions_calibrated = y["motion"]["directions_calibrated"].as<bool>();
   c.limits_calibrated = y["motion"]["limits_calibrated"].as<bool>();
+  c.surface_before_traversal = y["motion"]["surface_before_traversal"].as<bool>(false);
+  c.surface_depth_m = y["motion"]["surface_depth_m"].as<double>(0.5);
+  c.surface_tolerance_m = y["motion"]["surface_tolerance_m"].as<double>(0.05);
+  c.surface_stable_sec = y["motion"]["surface_stable_sec"].as<double>(1.0);
+  c.surface_timeout_sec = y["motion"]["surface_timeout_sec"].as<double>(30.0);
+  c.depth_deadzone_m = y["motion"]["depth_deadzone_m"].as<double>(0.05);
+  c.depth_recover_stable_sec = y["motion"]["depth_recover_stable_sec"].as<double>(0.5);
+  c.depth_pause_timeout_sec = y["motion"]["depth_pause_timeout_sec"].as<double>(10.0);
+  c.depart_speed = y["motion"]["depart_speed"].as<double>(0.08);
+  c.depart_duration_sec = y["motion"]["depart_duration_sec"].as<double>(2.0);
   c.route.surge_from_row = y["motion"]["surge_from_row"].as<double>();
   c.route.surge_from_col = y["motion"]["surge_from_col"].as<double>();
   c.route.sway_from_row = y["motion"]["sway_from_row"].as<double>();
@@ -243,6 +258,13 @@ static Config load_config(const std::string& path) {
       std::abs(c.route.surge_from_row*c.route.sway_from_col-
         c.route.surge_from_col*c.route.sway_from_row) < 1e-6))
     throw std::runtime_error("motion requires calibrated directions, limits and serial device");
+  if (c.surface_depth_m < 0.0 || c.surface_tolerance_m <= 0.0 ||
+      c.surface_stable_sec <= 0.0 || c.surface_timeout_sec <= 0.0)
+    throw std::runtime_error("surface configuration requires non-negative depth and positive tolerance/stable/timeout");
+  if (c.depth_deadzone_m < 0.0 || c.depth_recover_stable_sec <= 0.0 ||
+      c.depth_pause_timeout_sec <= 0.0 || c.depart_speed <= 0.0 ||
+      c.depart_duration_sec <= 0.0)
+    throw std::runtime_error("depth watchdog / departure requires non-negative deadzone and positive stable/timeout/speed");
   if (!c.camera_matrix.empty() && c.camera_matrix.size() != 9)
     throw std::runtime_error("camera_matrix must contain 9 values");
   if (!c.distortion.empty() && c.distortion.size() != 4 && c.distortion.size() != 5 &&
@@ -258,6 +280,7 @@ class Runtime {
  public:
   explicit Runtime(Config cfg) : cfg_(std::move(cfg)), mission_(cfg_.mission),
     route_(cfg_.route), planner_(cfg_.planner) {
+    surface_enabled_ = cfg_.surface_before_traversal;
     (void)auv_vision::AprilTagDetector(cfg_.apriltag_family);
     (void)auv_mapping::GridMapper(cfg_.grid);
     (void)auv_vision::ConeDetector(cfg_.cone);
@@ -313,6 +336,7 @@ class Runtime {
     log_cv_.notify_all(); logger.join();
   }
  private:
+  enum class TraverseStage { kSurfacing, kTraversing, kDeparting };
   void event(const std::string& name, const std::string& detail) {
     try {
     std::ostringstream line;
@@ -376,8 +400,47 @@ class Runtime {
   }
   void request_arm_locked(const std::string& source) {
     hold_depth_=status_.depth; hold_yaw_=status_.yaw;
+    traverse_stage_ = TraverseStage::kSurfacing;
+    surfacing_started_ = 0; surfacing_since_ = 0;
+    departing_started_ = 0; departure_done_ = false;
+    depth_paused_ = false; depth_paused_since_ = 0; depth_in_band_since_ = 0;
     armed_requested_ = true; arm_ack_ = false; arm_pending_ = true; arm_time_=0;
     event("ARM_REQUEST", source);
+  }
+  // Precompute the blind departure motion (leave the 3x3 grid after every cone
+  // is visited). The exit direction is a unit grid step from the last visited
+  // cone: edge/corner cells leave via the nearest outward step, the center cell
+  // turns toward an edge midpoint with no cone. The grid step is mapped to body
+  // surge/sway through the calibrated route gains, then normalized to
+  // depart_speed so departure stays within the calibrated speed envelope.
+  void compute_departure() {
+    exit_dr_ = 0; exit_dc_ = 0; depart_surge_ = 0.0F; depart_sway_ = 0.0F;
+    if (plan_.targets.empty()) return;
+    const int r = static_cast<int>(plan_.targets.back().row);
+    const int c = static_cast<int>(plan_.targets.back().col);
+    auto has_cone = [this](int rr, int cc) {
+      for (const auto& t : plan_.targets)
+        if (static_cast<int>(t.row) == rr && static_cast<int>(t.col) == cc) return true;
+      return false;
+    };
+    if ((r == 0 || r == 2) && (c == 0 || c == 2)) { exit_dr_ = (r == 0 ? -1 : 1); exit_dc_ = 0; }
+    else if (r == 0) { exit_dr_ = -1; exit_dc_ = 0; }
+    else if (r == 2) { exit_dr_ = 1; exit_dc_ = 0; }
+    else if (c == 0) { exit_dr_ = 0; exit_dc_ = -1; }
+    else if (c == 2) { exit_dr_ = 0; exit_dc_ = 1; }
+    else {
+      const int dirs[4][2] = {{-1,0},{1,0},{0,-1},{0,1}};
+      for (const auto& d : dirs) {
+        if (!has_cone(1 + d[0], 1 + d[1])) { exit_dr_ = d[0]; exit_dc_ = d[1]; break; }
+      }
+      if (exit_dr_ == 0 && exit_dc_ == 0) { exit_dr_ = -1; exit_dc_ = 0; }
+    }
+    double sx = cfg_.route.surge_from_row * exit_dr_ + cfg_.route.surge_from_col * exit_dc_;
+    double sy = cfg_.route.sway_from_row  * exit_dr_ + cfg_.route.sway_from_col  * exit_dc_;
+    const double mag = std::hypot(sx, sy);
+    if (mag > 1e-9) { sx = sx / mag * cfg_.depart_speed; sy = sy / mag * cfg_.depart_speed; }
+    depart_surge_ = static_cast<float>(sx);
+    depart_sway_ = static_cast<float>(sy);
   }
   bool claim_autonomous_run_locked() {
     const auto latch = cfg_.socket + ".autonomous-started";
@@ -765,13 +828,19 @@ class Runtime {
           if (frame_time_ <= 0 || now - frame_time_ > cfg_.frame_timeout) {
             set_fault_locked("camera frame timeout"); armed_requested_ = false; disarm_pending_ = true;
           }
-          if (phase == auv_mission::MissionPhase::kVisitCones && (!pose_valid_ || now - pose_time_ > cfg_.pose_timeout)) {
+          if (phase == auv_mission::MissionPhase::kVisitCones &&
+              !(surface_enabled_ && armed_requested_ &&
+                traverse_stage_ == TraverseStage::kSurfacing) &&
+              !depth_paused_ &&
+              !(traverse_stage_ == TraverseStage::kDeparting && armed_requested_) &&
+              (!pose_valid_ || now - pose_time_ > cfg_.pose_timeout)) {
             set_fault_locked("grid pose timeout"); armed_requested_ = false; disarm_pending_ = true;
           }
         }
         if (status_fresh(now)) mission_.update_status(serial_connected_,status_.armed,status_.error_flags,now);
         mission_.update_apriltag(tag_found_,now);
-        mission_.update_map(map_.complete, all_visited_,now);
+        if (tag_found_ && !cfg_.mission.full_mission) surface_enabled_ = true;
+        mission_.update_map(map_.complete, all_visited_ && departure_done_,now);
         if (phase == auv_mission::MissionPhase::kPlanCones && !route_ready_ && map_.complete &&
             (!pose_valid_ || now-pose_time_ > cfg_.pose_timeout)) {
           set_fault_locked("grid pose unavailable for planning");
@@ -782,7 +851,7 @@ class Runtime {
             static_cast<std::int8_t>(std::clamp(static_cast<int>(col_),0,2)),"unknown"};
           plan_ = planner_.plan(map_.grid,start);
           route_ready_ = plan_.valid && !plan_.targets.empty();
-          if (route_ready_) route_.set_route(plan_,++map_revision_);
+          if (route_ready_) { route_.set_route(plan_,++map_revision_); compute_departure(); }
           else { set_fault_locked("empty or invalid cone route: " + plan_.reason); disarm_pending_ = true; }
           std::ostringstream route_detail;
           route_detail << plan_.reason << " path=";
@@ -835,12 +904,51 @@ class Runtime {
             gripper_stop_requested_=true;
           }
         } else {
-          route_.set_mission_active(phase == auv_mission::MissionPhase::kVisitCones);
-          route_.set_vehicle_ready(cfg_.motion_enabled && armed_requested_ && arm_ack_ && status_.armed && safe_status(now));
+          const bool visiting = phase == auv_mission::MissionPhase::kVisitCones;
+          const bool surfacing = surface_enabled_ && visiting &&
+            traverse_stage_ == TraverseStage::kSurfacing;
+          const bool departing = visiting && traverse_stage_ == TraverseStage::kDeparting;
+          const bool armed_moving = cfg_.motion_enabled && armed_requested_ && arm_ack_ &&
+            status_.armed && safe_status(now);
+          const double target_depth = surface_enabled_ ? cfg_.surface_depth_m : hold_depth_;
+
+          // Depth hold watchdog (traversal + departure): pause horizontal motion
+          // if the depth leaves the dead zone around target_depth so the STM32
+          // depth PID can recover it; resume once it stays in band for the
+          // configured stable time. Escalates to FAULT after depth_pause_timeout_sec.
+          if (armed_moving &&
+              (traverse_stage_ == TraverseStage::kTraversing ||
+               traverse_stage_ == TraverseStage::kDeparting) &&
+              status_fresh(now) && std::isfinite(status_.depth)) {
+            const double err = std::fabs(status_.depth - target_depth);
+            if (!depth_paused_) {
+              if (err > cfg_.depth_deadzone_m) {
+                depth_paused_ = true; depth_paused_since_ = now; depth_in_band_since_ = 0;
+              }
+            } else {
+              if (err <= cfg_.depth_deadzone_m) {
+                if (depth_in_band_since_ <= 0) depth_in_band_since_ = now;
+                else if (now - depth_in_band_since_ >= cfg_.depth_recover_stable_sec)
+                  depth_paused_ = false;
+              } else {
+                depth_in_band_since_ = 0;
+              }
+              if (now - depth_paused_since_ > cfg_.depth_pause_timeout_sec) {
+                set_fault_locked("depth hold timeout (cone collision risk)");
+                armed_requested_ = false; disarm_pending_ = true; motion_ = {};
+              }
+            }
+          } else if (depth_paused_) {
+            depth_paused_ = false; depth_in_band_since_ = 0; depth_paused_since_ = 0;
+          }
+
+          const bool hold_route = surfacing || departing || depth_paused_;
+          route_.set_mission_active(visiting && !hold_route);
+          route_.set_vehicle_ready(armed_moving);
           route_.set_pose(pose_valid_ && now-pose_time_ <= cfg_.pose_timeout,row_,col_);
           const auto step = route_.step();
           waypoint_index_ = step.waypoint_index;
-          if (phase == auv_mission::MissionPhase::kVisitCones && step.state == auv_control::RouteStep::State::kFault)
+          if (visiting && step.state == auv_control::RouteStep::State::kFault)
             { set_fault_locked(step.detail); armed_requested_ = false; disarm_pending_ = true; }
           if (step.visited_cell) {
             auto i = static_cast<std::size_t>(step.visited_cell->row*3+step.visited_cell->col);
@@ -848,11 +956,52 @@ class Runtime {
           }
           all_visited_ = !plan_.targets.empty();
           for (const auto& t : plan_.targets) all_visited_ &= visited_[static_cast<std::size_t>(t.row*3+t.col)];
+
+          // After every cone is visited, leave the 3x3 grid along the precomputed
+          // exit direction (blind, fixed duration), then report completion.
+          if (visiting && traverse_stage_ == TraverseStage::kTraversing &&
+              all_visited_ && armed_requested_ && fault_.empty()) {
+            traverse_stage_ = TraverseStage::kDeparting;
+            departing_started_ = 0;
+            std::ostringstream detail;
+            detail << "exit=(" << exit_dr_ << ',' << exit_dc_ << ')';
+            event("DEPARTING", detail.str());
+          }
+
           motion_ = {};
-          if (armed_requested_) { motion_.depth=hold_depth_; motion_.yaw=hold_yaw_; }
-          if (step.state == auv_control::RouteStep::State::kRunning && armed_requested_ && fault_.empty()) {
+          if (armed_requested_) {
+            motion_.yaw = hold_yaw_;
+            motion_.depth = target_depth;
+          }
+          if (surfacing && armed_moving) {
+            if (surfacing_started_ <= 0) surfacing_started_ = now;
+            if (status_fresh(now) && std::isfinite(status_.depth) &&
+                std::fabs(status_.depth - cfg_.surface_depth_m) <= cfg_.surface_tolerance_m) {
+              if (surfacing_since_ <= 0) surfacing_since_ = now;
+              else if (now - surfacing_since_ >= cfg_.surface_stable_sec) {
+                traverse_stage_ = TraverseStage::kTraversing;
+                std::ostringstream detail;
+                detail << "depth=" << status_.depth << " m";
+                event("SURFACED", detail.str());
+              }
+            } else {
+              surfacing_since_ = 0;
+            }
+            if (surfacing_started_ > 0 && now - surfacing_started_ > cfg_.surface_timeout_sec) {
+              set_fault_locked("surface timeout");
+              armed_requested_ = false; disarm_pending_ = true; motion_ = {};
+            }
+          } else if (departing && armed_moving) {
+            if (departing_started_ <= 0) departing_started_ = now;
+            if (!depth_paused_) {
+              motion_.vx = depart_surge_; motion_.vy = depart_sway_;
+            }
+            if (now - departing_started_ >= cfg_.depart_duration_sec)
+              departure_done_ = true;
+          } else if (step.state == auv_control::RouteStep::State::kRunning && armed_requested_ && fault_.empty() && !depth_paused_) {
             motion_.vx = static_cast<float>(step.surge); motion_.vy = static_cast<float>(step.sway);
-            motion_.depth = hold_depth_; motion_.yaw = hold_yaw_;
+            motion_.depth = target_depth;
+            motion_.yaw = hold_yaw_;
           }
         }
         const auto snapshot = mission_.snapshot();
@@ -915,6 +1064,10 @@ class Runtime {
         << ",\"apriltag_found\":" << (tag_found_ ? "true":"false")
         << ",\"cone_count\":" << map_.cone_count << ",\"route_waypoints\":" << plan_.path.size()
         << ",\"pose_valid\":" << (pose_valid_ ? "true":"false")
+        << ",\"surfacing\":" << (surface_enabled_ && traverse_stage_ == TraverseStage::kSurfacing ? "true":"false")
+        << ",\"departing\":" << (traverse_stage_ == TraverseStage::kDeparting ? "true":"false")
+        << ",\"depth_paused\":" << (depth_paused_ ? "true":"false")
+        << ",\"surface_depth_m\":" << cfg_.surface_depth_m
         << ",\"row\":" << (std::isfinite(row_) ? row_ : -1.0F)
         << ",\"col\":" << (std::isfinite(col_) ? col_ : -1.0F)
         << ",\"next_waypoint_index\":" << waypoint_index_
@@ -980,6 +1133,12 @@ class Runtime {
       fault_.clear(); route_.reset(); route_ready_=false; plan_={}; map_={};
       visited_.fill(false); all_visited_=false; tag_found_=false;
       pose_valid_=false; pose_time_=0; waypoint_index_=0;
+      traverse_stage_ = TraverseStage::kSurfacing;
+      surfacing_started_ = 0; surfacing_since_ = 0;
+      surface_enabled_ = cfg_.surface_before_traversal;
+      departing_started_ = 0; departure_done_ = false;
+      depth_paused_ = false; depth_paused_since_ = 0; depth_in_band_since_ = 0;
+      exit_dr_ = 0; exit_dc_ = 0; depart_surge_ = 0.0F; depart_sway_ = 0.0F;
       gripper_close_requested_=false; gripper_open_requested_=false;
       gripper_stop_requested_=false;
       gripper_pending_.reset(); gripper_ack_=false; gripper_command_time_=0;
@@ -1239,6 +1398,15 @@ class Runtime {
   double gripper_command_time_{};
   std::atomic<double> last_control_time_{seconds()};
   float hold_depth_{},hold_yaw_{};
+  TraverseStage traverse_stage_{TraverseStage::kSurfacing};
+  double surfacing_started_{0},surfacing_since_{0};
+  bool surface_enabled_{false};
+  double departing_started_{0};
+  bool departure_done_{false};
+  bool depth_paused_{false};
+  double depth_paused_since_{0}, depth_in_band_since_{0};
+  int exit_dr_{0}, exit_dc_{0};
+  float depart_surge_{0.0F}, depart_sway_{0.0F};
   std::size_t waypoint_index_{};
   std::unique_ptr<Localization> localization_;
   bool tag_found_{},pose_valid_{},route_ready_{},all_visited_{},serial_connected_{},armed_requested_{},arm_ack_{},arm_pending_{},disarm_pending_{true};

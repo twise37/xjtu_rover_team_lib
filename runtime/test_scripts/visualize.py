@@ -102,7 +102,7 @@ def _cells_and_visited(state):
     return cells, visited
 
 
-def _save_summary(name, state, cells, visited, path, phases) -> None:
+def _save_summary(name, state, cells, visited, path, phases, motion=None) -> None:
     lines = [
         f"scene: {name}",
         f"phase: {state.get('phase')}",
@@ -120,6 +120,21 @@ def _save_summary(name, state, cells, visited, path, phases) -> None:
             mark = "*" if (r, c) in visited else " "
             row.append(f"({r},{c})={obj}{mark}")
         lines.append("  " + " ".join(row))
+    if motion:
+        moving = [m for m in motion if abs(m["vx"]) > 1e-3 or abs(m["vy"]) > 1e-3]
+        lines.append("motion output:")
+        if moving:
+            first = moving[0]
+            lines.append(
+                f"  first_nonzero: vx={first['vx']:.6f} vy={first['vy']:.6f} "
+                f"depth={first['depth']:.6f} yaw={first['yaw']:.6f}")
+            lines.append(f"  frames: {len(motion)} total, {len(moving)} nonzero")
+            bounded = all(
+                abs(m["vx"]) <= 0.1 + 1e-6 and abs(m["vy"]) <= 0.1 + 1e-6
+                for m in motion)
+            lines.append(f"  bounded(<=0.1): {'yes' if bounded else 'no'}")
+        else:
+            lines.append("  (no nonzero motion observed)")
     (run_dir() / f"summary_{name}.txt").write_text("\n".join(lines) + "\n")
 
 
@@ -136,8 +151,21 @@ def _save_snapshots(name, snapshots) -> None:
         )
 
 
-def write_scene_artifacts(name, harness, state, snapshots=None) -> None:
-    """Render and persist map / path / grid / summary / events / snapshots."""
+def _write_motion_timeline(name, motion) -> None:
+    """Persist the decoded MOTION_TARGET timeline as one NDJSON line per frame."""
+    if not motion:
+        return
+    (run_dir() / f"motion_{name}.ndjson").write_text(
+        "".join(json.dumps(m, sort_keys=True) + "\n" for m in motion)
+    )
+
+
+def write_scene_artifacts(name, harness, state, snapshots=None, motion=None) -> None:
+    """Render and persist map / path / grid / summary / events / snapshots.
+
+    ``motion``, when given, is the list of decoded MOTION_TARGET frames recorded
+    by the virtual STM32; it is archived as an NDJSON timeline and summarised.
+    """
     run_dir()
     cells, visited = _cells_and_visited(state)
     events = harness.events()
@@ -147,6 +175,7 @@ def write_scene_artifacts(name, harness, state, snapshots=None) -> None:
     if path:
         _write_png(f"path_{name}", render_path(cells, path, visited, title=f"{name}: planned path"))
     _copy_runtime_debug(harness, name)
-    _save_summary(name, state, cells, visited, path, phases)
+    _save_summary(name, state, cells, visited, path, phases, motion=motion)
     _save_events(name, harness)
     _save_snapshots(name, snapshots)
+    _write_motion_timeline(name, motion)

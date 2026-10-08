@@ -59,15 +59,18 @@ def plan_path(events: list[dict]) -> list[tuple[int, int]]:
 class RuntimeHarness:
     """Context manager that runs auv_runtime against a virtual STM32."""
 
-    def __init__(self, binary: str, video: pathlib.Path):
+    def __init__(self, binary: str, video: pathlib.Path, motion: bool = False):
         self.binary = binary
         self.video = video
+        self.motion = motion
         self.root = None
         self._proc = None
         self._master = None
         self._slave = None
         self._stop = None
         self._worker = None
+        self._motion_targets: list = []
+        self._arm_events: list = []
 
     def __enter__(self) -> "RuntimeHarness":
         self.root = pathlib.Path(tempfile.mkdtemp(prefix="auv-test-"))
@@ -92,8 +95,29 @@ class RuntimeHarness:
         config = config.replace(
             "/usr/local/share/auv-runtime/web", str(REPO_ROOT / "runtime" / "web")
         )
-        # Keep every safety flag off: no motion output, no arm, no auto-start.
+        # Keep video/auto-start off regardless. In motion mode also enable a
+        # calibrated (synthetic) motion configuration so the runtime can ARM and
+        # emit MOTION_TARGET frames; the serial stays on the PTY only.
         config = config.replace("enabled: true", "enabled: false")
+        if self.motion:
+            config = config.replace(
+                "motion_commands_enabled: false", "motion_commands_enabled: true"
+            )
+            config = config.replace(
+                "directions_calibrated: false", "directions_calibrated: true"
+            )
+            config = config.replace(
+                "limits_calibrated: false", "limits_calibrated: true"
+            )
+            config = config.replace(
+                "camera_matrix: []", "camera_matrix: [600, 0, 320, 0, 600, 240, 0, 0, 1]"
+            )
+            config = config.replace(
+                "distortion_coefficients: []", "distortion_coefficients: [0, 0, 0, 0, 0]"
+            )
+            config = config.replace("surge_from_row: 0.0", "surge_from_row: 0.1")
+            config = config.replace("sway_from_col: 0.0", "sway_from_col: 0.1")
+            config = config.replace("pose_timeout_sec: 0.5", "pose_timeout_sec: 2.0")
         (self.root / "runtime.yaml").write_text(config)
 
         self._proc = subprocess.Popen(
@@ -103,17 +127,55 @@ class RuntimeHarness:
         )
 
         self._stop = threading.Event()
-        # STATUS payload: seq=1, flags=0 (not armed / no leak), error=0,
-        # voltage=12.0, depth=1.0, roll/pitch/yaw=0, thruster_count=0.
-        status = struct.pack("<IBIfffffB", 1, 0, 0, 12.0, 1.0, 0.0, 0.0, 0.0, 0)
 
+        # Virtual STM32: streams STATUS (the armed flag follows ARM requests),
+        # ACKs SET_ARMED / ACTUATOR_COMMAND, and records every decoded
+        # MOTION_TARGET frame as a (seq, vx, vy, depth, yaw) timeline so tests
+        # can assert the onset of propulsion to the STM32.
         def stm32() -> None:
+            incoming = bytearray()
+            sequence = 0
+            armed = False
+            current_depth = 1.0
             while not self._stop.is_set():
                 try:
-                    os.write(self._master, frame(0x80, status))
+                    sequence += 1
+                    payload = struct.pack(
+                        "<IBIfffffB", sequence, int(armed), 0,
+                        12.0, current_depth, 0.0, 0.0, 0.0, 0)
+                    os.write(self._master, frame(0x80, payload))
                     readable, _, _ = select.select([self._master], [], [], 0.05)
                     if readable:
-                        os.read(self._master, 8192)
+                        incoming.extend(os.read(self._master, 8192))
+                    while len(incoming) >= 7:
+                        if incoming[:2] != b"\xaa\x55":
+                            del incoming[0]
+                            continue
+                        length = 7 + incoming[4]
+                        if len(incoming) < length:
+                            break
+                        packet = bytes(incoming[:length])
+                        del incoming[:length]
+                        if crc(packet[2:-2]) != struct.unpack("<H", packet[-2:])[0]:
+                            continue
+                        kind, data = packet[3], packet[5:-2]
+                        if kind == 2:  # SET_ARMED -> ACK + flip armed flag
+                            armed = bool(data[4])
+                            self._arm_events.append((time.monotonic(), armed))
+                            os.write(self._master, frame(0x7f, bytes([2, 0]) + data[:4]))
+                        elif kind == 3:  # MOTION_TARGET -> record + track depth
+                            seq, vx, vy, cmd_depth, yaw = struct.unpack("<Iffff", data)
+                            current_depth = cmd_depth  # emulate depth PID tracking the target
+                            self._motion_targets.append({
+                                "seq": seq, "vx": vx, "vy": vy,
+                                "depth": cmd_depth, "yaw": yaw,
+                                "armed": armed, "t": time.monotonic(),
+                            })
+                        elif kind == 4:  # ACTUATOR_COMMAND -> ACK
+                            seq, actuator, value = struct.unpack("<IBf", data)
+                            os.write(
+                                self._master,
+                                frame(0x7f, bytes([4, 0]) + struct.pack("<I", seq)))
                 except OSError:
                     return
 
@@ -167,6 +229,14 @@ class RuntimeHarness:
         reply = self.command("start")
         assert reply.startswith("OK"), f"start rejected: {reply!r}"
         return reply
+
+    def motion_targets(self) -> list:
+        return list(self._motion_targets)
+
+    def has_nonzero_motion(self) -> bool:
+        return any(
+            abs(t["vx"]) > 1e-3 or abs(t["vy"]) > 1e-3 for t in self._motion_targets
+        )
 
     def run_to_visit(
         self,
